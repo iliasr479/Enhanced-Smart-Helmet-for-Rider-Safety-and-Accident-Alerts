@@ -1,0 +1,202 @@
+#include <Wire.h>
+#include <MPU6050.h>
+#include <TinyGPS++.h>
+#include <SoftwareSerial.h>
+#include <RH_ASK.h>
+
+// Initialize the MPU6050 sensor and GPS module
+MPU6050 mpu;
+TinyGPSPlus gps;
+
+// SIM900A GSM Module
+SoftwareSerial sim900(7, 8); // RX, TX
+// Neo 6M GPS Module
+SoftwareSerial gpsSerial(4, 3); // RX, TX
+
+// RF driver for crash detection
+RH_ASK rf_driver(2000);
+
+// Pin definitions
+const int LED_PIN = 5;  // Crash detection LED
+const int MQ3_PIN = A0; // Alcohol sensor input pin
+const float ALC_THRESH = 3.0;
+const float IMPACT_THRESHOLD = 1.5; // Crash detection threshold
+
+// Moving average variables for alcohol sensor
+const int MOVING_AVG_SIZE = 10;  // Number of samples for moving average
+float mq3Readings[MOVING_AVG_SIZE]; // Array to store last readings
+int mq3Index = 0; // Index for the next reading
+float mq3Avg = 0.0; // Moving average of MQ3 sensor readings
+
+// Moving average variables for MPU6050 data
+float axReadings[MOVING_AVG_SIZE];
+float ayReadings[MOVING_AVG_SIZE];
+float azReadings[MOVING_AVG_SIZE];
+int mpuIndex = 0; // Index for MPU6050 data buffer
+float axAvg = 0.0, ayAvg = 0.0, azAvg = 0.0; // Moving averages for MPU6050 data
+
+// Variables for crash detection
+bool crashState = false;
+unsigned long crashStartTime = 0;
+
+// GPS coordinates for the location (Example)
+float latitude = 90.390693;
+float longitude = 23.726440;
+
+void setup() {
+  Serial.begin(9600);    // Initialize serial communication for debugging
+  gpsSerial.begin(9600); // GPS module baud rate
+  sim900.begin(9600);    // GSM module baud rate
+  rf_driver.init();      // Initialize RF module for crash detection
+
+  Wire.begin();
+  mpu.initialize();
+  pinMode(LED_PIN, OUTPUT);  // Set LED pin as output
+  digitalWrite(LED_PIN, LOW); // Start with LED off
+
+  // Initialize the MQ3 readings and MPU6050 buffers
+  for (int i = 0; i < MOVING_AVG_SIZE; i++) {
+    mq3Readings[i] = 0;
+    axReadings[i] = 0;
+    ayReadings[i] = 0;
+    azReadings[i] = 0;
+  }
+
+  if (mpu.testConnection()) {
+    Serial.println("MPU6050 Connected");
+  } else {
+    Serial.println("MPU6050 Connection FAILED!");
+  }
+
+  Serial.println("System Initialized...");
+}
+
+void loop() {
+  while (gpsSerial.available() > 0) {
+    gps.encode(gpsSerial.read()); // Get GPS data
+  }
+
+  // Check for crash detection
+  checkCrash();
+
+  // Read the alcohol sensor value and apply moving average
+  int mq3Value = analogRead(MQ3_PIN);
+  float mq3Voltage = mq3Value * (5.0 / 1023.0); // Convert to voltage
+
+  // Update moving average with the new sensor reading for alcohol sensor
+  mq3Readings[mq3Index] = mq3Voltage; 
+  mq3Index = (mq3Index + 1) % MOVING_AVG_SIZE;  // Circular buffer logic
+
+  // Calculate the moving average for the alcohol sensor
+  mq3Avg = 0.0;
+  for (int i = 0; i < MOVING_AVG_SIZE; i++) {
+    mq3Avg += mq3Readings[i];
+  }
+  mq3Avg /= MOVING_AVG_SIZE; // Calculate the average
+
+  Serial.print("MQ3 Moving Average: ");
+  Serial.println(mq3Avg);
+
+  // Read the MPU6050 accelerometer data and apply moving average
+  int16_t ax_raw, ay_raw, az_raw;
+  mpu.getAcceleration(&ax_raw, &ay_raw, &az_raw);
+
+  // Convert raw data to acceleration values
+  float ax = ax_raw / 16384.0;
+  float ay = ay_raw / 16384.0;
+  float az = az_raw / 16384.0;
+
+  // Update moving averages for accelerometer readings
+  axReadings[mpuIndex] = ax;
+  ayReadings[mpuIndex] = ay;
+  azReadings[mpuIndex] = az;
+  mpuIndex = (mpuIndex + 1) % MOVING_AVG_SIZE; // Circular buffer for MPU data
+
+  // Calculate moving averages for MPU accelerometer data
+  axAvg = 0.0;
+  ayAvg = 0.0;
+  azAvg = 0.0;
+  for (int i = 0; i < MOVING_AVG_SIZE; i++) {
+    axAvg += axReadings[i];
+    ayAvg += ayReadings[i];
+    azAvg += azReadings[i];
+  }
+  axAvg /= MOVING_AVG_SIZE; // Calculate average for X-axis
+  ayAvg /= MOVING_AVG_SIZE; // Calculate average for Y-axis
+  azAvg /= MOVING_AVG_SIZE; // Calculate average for Z-axis
+
+  Serial.print("ax Avg: ");
+  Serial.print(axAvg);
+  Serial.print(" | ay Avg: ");
+  Serial.print(ayAvg);
+  Serial.print(" | az Avg: ");
+  Serial.println(azAvg);
+
+  // If crash is detected, send SMS and RF signal
+  if (crashState) {
+    sendSMS();
+    rf_driver.send((uint8_t *)"CRASH", 5);  // Send crash signal via RF
+    rf_driver.waitPacketSent();
+    digitalWrite(LED_PIN, HIGH); // Turn on LED
+    delay(10000); // Hold crash detection for 10 seconds
+    digitalWrite(LED_PIN, LOW);  // Turn off LED
+    crashState = false; // Reset crash state
+  }
+
+  // If alcohol detected based on moving average, send RF signal and SMS
+  if (mq3Avg > ALC_THRESH) {
+    sendSMS("ALCOHOL DETECTED");
+    rf_driver.send((uint8_t *)"ALCOHOL", 7); // Send alcohol detection signal
+    rf_driver.waitPacketSent();
+    Serial.println("ALCOHOL Sent");
+  } else {
+    rf_driver.send((uint8_t *)"NORMAL", 6);  // Send normal signal
+    rf_driver.waitPacketSent();
+    Serial.println("NORMAL Sent");
+  }
+
+  delay(1000);
+}
+
+// Function to check for crash detection
+void checkCrash() {
+  // Calculate magnitude of the acceleration (use moving averages for smoother detection)
+  float A = sqrt(axAvg * axAvg + ayAvg * ayAvg + azAvg * azAvg);
+  float deltaA = abs(A - 1.0);  // Compare to gravity
+
+  // If the delta exceeds the threshold, consider it a crash
+  if (deltaA > IMPACT_THRESHOLD && !crashState) {
+    Serial.println("CRASH DETECTED!");
+    crashState = true;
+    crashStartTime = millis();
+  }
+}
+
+// Function to read GPS data and send SMS
+void sendSMS(const char *message = "Crash Detected!") {
+  Serial.println("Sending SMS...");
+
+  // Send command to set SMS format to text mode
+  sim900.println("AT+CMGF=1");
+  delay(1000);
+
+  // Send command to set the recipient phone number (replace with your number)
+  sim900.println("AT+CMGS=\"+8801627978697\""); // replace with your number
+  delay(1000);
+
+  // Send the SMS content
+  sim900.print(message);
+  sim900.print("\nLocation:\n");
+  sim900.print("Latitude: ");
+  sim900.println(gps.location.lat(), 6);  // Display Latitude
+  sim900.print("Longitude: ");
+  sim900.println(gps.location.lng(), 6);  // Display Longitude
+  sim900.print("Google Maps: https://maps.google.com/?q=");
+  sim900.print(gps.location.lat(), 6);
+  sim900.print(",");
+  sim900.println(gps.location.lng(), 6);
+  sim900.write(26); // End of SMS (Ctrl+Z)
+
+  // Print SMS sent status to Serial Monitor
+  Serial.println("SMS Sent!");
+}

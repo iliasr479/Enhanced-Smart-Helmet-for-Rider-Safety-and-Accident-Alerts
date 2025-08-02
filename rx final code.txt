@@ -1,0 +1,106 @@
+#include <RH_ASK.h>
+#include <SPI.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+RH_ASK rf_driver(2000);
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+const int LED_PIN = 8;
+const int BUZZER_PIN = 9;
+const int RELAY_PIN = 7;
+
+unsigned long lastSignalTime = 0;
+const unsigned long SIGNAL_TIMEOUT = 10000;  // ms
+
+enum State { HELMET_NOT_WORN, NORMAL, ALCOHOL, CRASH };
+State systemState = HELMET_NOT_WORN;
+
+void setup() {
+  Serial.begin(9600);
+
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(RELAY_PIN, OUTPUT);
+
+  digitalWrite(LED_PIN, LOW);
+  digitalWrite(BUZZER_PIN, LOW);
+  digitalWrite(RELAY_PIN, LOW); // By default, motor OFF
+
+  lcd.init();
+  lcd.backlight();
+  lcd.setCursor(0, 0);
+  lcd.print("Status: ");
+  lcd.setCursor(0, 1);
+  lcd.print("System Starting");
+
+  if (!rf_driver.init()) {
+    Serial.println("RF Rx init failed!");
+  } else {
+    Serial.println("Bike Rx Ready");
+  }
+}
+
+void loop() {
+  uint8_t buf[12];
+  uint8_t buflen = sizeof(buf);
+
+  if (rf_driver.recv(buf, &buflen)) {
+    buf[buflen] = '\0';
+    lastSignalTime = millis();
+
+    if (strcmp((char*)buf, "ALCOHOL") == 0) {
+      systemState = ALCOHOL;
+    } else if (strcmp((char*)buf, "NORMAL") == 0) {
+      systemState = NORMAL;
+    } else if (strcmp((char*)buf, "CRASH") == 0) {
+      systemState = CRASH;
+    }
+  }
+
+  // If no signal for too long, helmet is not worn
+  if (millis() - lastSignalTime > SIGNAL_TIMEOUT) {
+    systemState = HELMET_NOT_WORN;
+  }
+
+  // Handle system states based on received message
+  if (systemState == CRASH) {
+    Serial.println("Crash Detected!");
+    digitalWrite(LED_PIN, HIGH);   // Turn on LED
+    digitalWrite(BUZZER_PIN, HIGH); // Turn on Buzzer
+    digitalWrite(RELAY_PIN, LOW);   // Turn off motor
+    lcd.setCursor(0, 0);
+    lcd.print("Status: ALERT!  ");
+    lcd.setCursor(0, 1);
+    lcd.print("Crash Detected  ");
+  } else if (systemState == ALCOHOL) {
+    Serial.println("Alcohol Detected!");
+    digitalWrite(LED_PIN, HIGH);
+    digitalWrite(BUZZER_PIN, HIGH);
+    digitalWrite(RELAY_PIN, LOW); // Turn off motor
+    lcd.setCursor(0, 0);
+    lcd.print("Status: ALERT!  ");
+    lcd.setCursor(0, 1);
+    lcd.print("Alcohol Detected");
+  } else if (systemState == NORMAL) {
+    Serial.println("Normal - Helmet OK");
+    digitalWrite(LED_PIN, LOW);
+    digitalWrite(BUZZER_PIN, LOW);
+    digitalWrite(RELAY_PIN, HIGH); // Turn on motor
+    lcd.setCursor(0, 0);
+    lcd.print("Status: NORMAL  ");
+    lcd.setCursor(0, 1);
+    lcd.print("Helmet OK       ");
+  } else if (systemState == HELMET_NOT_WORN) {
+    Serial.println("Helmet Not Worn");
+    digitalWrite(LED_PIN, LOW);
+    digitalWrite(BUZZER_PIN, LOW);
+    digitalWrite(RELAY_PIN, LOW); // Turn off motor
+    lcd.setCursor(0, 0);
+    lcd.print("Status: ALERT!  ");
+    lcd.setCursor(0, 1);
+    lcd.print("Helmet Not Worn ");
+  }
+
+  delay(1000);
+}

@@ -1,0 +1,122 @@
+#include <SoftwareSerial.h>
+#include <TinyGPS++.h>
+#include <RH_ASK.h>
+#include <SPI.h>
+#include <Wire.h>
+#include <MPU6050.h>
+
+// GPS TX to Arduino D4, GPS RX to Arduino D3
+SoftwareSerial gpsSerial(4, 3); // RX, TX
+TinyGPSPlus gps;
+
+RH_ASK rf_driver(2000);
+MPU6050 mpu;
+
+const int MQ3_PIN = A0;
+const float ALC_THRESH = 3.5;
+const int LED_PIN = 8;  // Crash detection LED
+const float IMPACT_THRESHOLD = 1.5;  // Crash threshold
+
+float latitude = 90.390693;
+float longitude = 23.726440;
+
+bool crashState = false;
+unsigned long crashStartTime = 0;
+
+void setup() {
+  Serial.begin(9600);
+  gpsSerial.begin(9600);   // GPS module baud rate
+  Serial.println("Waiting for GPS signal...");
+
+  if (!rf_driver.init()) {
+    Serial.println("RF Tx init failed!");
+  } else {
+    Serial.println("Helmet Tx Ready");
+  }
+
+  Wire.begin();
+  mpu.initialize();
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+
+  if (mpu.testConnection()) {
+    Serial.println("MPU6050 Connected OK");
+  } else {
+    Serial.println("MPU6050 Connection FAILED!");
+  }
+}
+
+void loop() {
+  while (gpsSerial.available() > 0) {
+    gps.encode(gpsSerial.read());
+  }
+
+  // Read alcohol sensor
+  int mq3Value = analogRead(MQ3_PIN);
+  float mq3Voltage = mq3Value * (5.0 / 1023.0);
+  Serial.print("MQ3 Voltage: ");
+  Serial.println(mq3Voltage);
+
+  // Crash detection logic
+  int16_t ax_raw, ay_raw, az_raw;
+  mpu.getAcceleration(&ax_raw, &ay_raw, &az_raw);
+  float ax = ax_raw / 16384.0;
+  float ay = ay_raw / 16384.0;
+  float az = az_raw / 16384.0;
+
+    // Print acceleration values to the serial monitor for debugging
+  Serial.print("ax: ");
+  Serial.print(ax);
+  Serial.print(" | ay: ");
+  Serial.print(ay);
+  Serial.print(" | az: ");
+  Serial.println(az);
+
+  float A = sqrt(ax * ax + ay * ay + az * az);
+  float deltaA = abs(A - 1.0);
+  
+  // Print acceleration magnitude and delta value to monitor crash detection
+  Serial.print("A: ");
+  Serial.print(A);
+  Serial.print(" | Delta: ");
+  Serial.println(deltaA);
+  
+  if (deltaA > IMPACT_THRESHOLD && !crashState) {
+    Serial.println("!!! CRASH DETECTED !!!");
+
+    Serial.print("Latitude: ");
+    Serial.println(latitude, 6);
+    Serial.print("Longitude: ");
+    Serial.println(longitude, 6);
+
+    digitalWrite(LED_PIN, HIGH); // Turn on LED
+    crashState = true;
+    crashStartTime = millis();
+    rf_driver.send((uint8_t *)"CRASH", 5); // Send crash signal to RX
+    rf_driver.waitPacketSent();
+  }
+
+  // Alcohol detection
+  else if (mq3Voltage > ALC_THRESH) {
+    const char *msg = "ALCOHOL";
+    rf_driver.send((uint8_t *)msg, strlen(msg));
+    rf_driver.waitPacketSent();
+    Serial.println("ALCOHOL Sent");
+  } 
+  else {
+    const char *msg = "NORMAL";
+    rf_driver.send((uint8_t *)msg, strlen(msg));
+    rf_driver.waitPacketSent();
+    Serial.println("NORMAL Sent");
+  }
+
+  // Crash state reset after a delay
+  if (crashState) {  // LED stays ON for 10 seconds
+    delay(10000);
+    digitalWrite(LED_PIN, LOW); // Turn off LED
+    crashState = false;
+    Serial.println("Crash state cleared.");
+  }
+
+  delay(1000);
+}
